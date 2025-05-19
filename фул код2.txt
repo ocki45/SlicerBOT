@@ -1,0 +1,383 @@
+import os
+import math
+from telegram import Bot
+import logging
+from pathlib import Path
+import tempfile
+import trimesh
+import pyvista as pv
+import numpy as np
+from shapely.geometry import Polygon, MultiPolygon, LineString, GeometryCollection, MultiLineString
+from shapely.ops import unary_union, linemerge
+from shapely.validation import make_valid
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import vtk
+from shapely import affinity
+from svgwrite import Drawing
+from typing import List, Union
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+
+class SliceEngine:
+    def __init__(self):
+        self.settings = {
+            'layer_height': 0.2,
+            'nozzle_diameter': 0.4,
+            'filament_diameter': 1.75,
+            'print_temp': 210,
+            'bed_temp': 60,
+            'travel_speed': 150,
+            'print_speed': 50,
+            'outer_wall_speed': 30,
+            'infill_speed': 80,
+            'infill_density': 25,
+            'retraction': 5,
+            'retract_speed': 40,
+            'z_hop': 0.3,
+            'bottom_layers': 4,
+            'top_layers': 4,
+            'perimeters': 6,
+            'small_feature': 0.001,
+            'solid_overlap': 0.15,
+            'fill_angles': [45],
+            'mitre_limit': 5.0,
+            'simplify_tolerance': 0.001,
+            'xy_compensation': -0.03,
+            'min_segment_length': 0.2,
+            'debug_mode': True,
+            'output_svg': False
+        }
+        self.current_e = 0
+        logging.basicConfig(level=logging.INFO)
+
+    def process(self, stl_path: str, gcode_path: str) -> None:
+        """Основной процесс обработки модели"""
+        try:
+            mesh = self._load_and_repair_mesh(stl_path)
+            layers = self._slice_model(mesh)
+            if self.settings['output_svg']:
+                self._export_svg(layers, "debug")
+            self._export_gcode(layers, gcode_path)
+            logging.info("Слайсинг успешно завершен")
+        except Exception as e:
+            logging.error(f"Критическая ошибка: {str(e)}", exc_info=True)
+            raise
+
+    def _load_and_repair_mesh(self, path: str) -> trimesh.Trimesh:
+        """Загрузка и восстановление 3D модели"""
+        mesh = trimesh.load(path, force='mesh')
+        if not mesh.is_watertight:
+            logging.warning("Модель не водонепроницаема, выполняется восстановление...")
+            mesh.fill_holes()
+            mesh.process()
+            if not mesh.is_watertight:
+                raise ValueError("Не удалось восстановить модель")
+        return mesh
+
+    def _slice_model(self, mesh: trimesh.Trimesh) -> List[dict]:
+        """Нарезка модели на слои с улучшенной обработкой"""
+        layers = []
+        z_min, z_max = mesh.bounds[:, 2]
+        total_layers = int(math.ceil((z_max - z_min) / self.settings['layer_height']))
+
+        for layer_num in range(total_layers):
+            z = z_min + layer_num * self.settings['layer_height']
+            section = self._process_layer(mesh, z)
+
+            if not section.is_empty:
+                layers.append({
+                    'z': z,
+                    'walls': self._generate_walls(section),
+                    'infill': self._generate_infill(section, layer_num, total_layers)
+                })
+
+        return layers
+
+    def _process_layer(self, mesh: trimesh.Trimesh, z: float) -> MultiPolygon:
+        """Обработка слоя с улучшенным сохранением деталей"""
+        try:
+            section = mesh.section(plane_origin=[0, 0, z], plane_normal=[0, 0, 1])
+            if not section:
+                return MultiPolygon()
+
+            # Особые настройки для верхних слоев
+            is_top = z > (mesh.bounds[1][2] - self.settings['layer_height'] * 3)
+            simplify_tol = 0 if is_top else self.settings['simplify_tolerance']
+
+            polygons = []
+            for path in section.discrete:
+                points = np.array([p[:2] for p in path])
+                if len(points) < 3:
+                    continue
+
+                poly = Polygon(points) \
+                    .buffer(self.settings['xy_compensation'], resolution=32) \
+                    .simplify(simplify_tol) \
+                    .buffer(0.01 if is_top else 0) \
+                    .buffer(-0.01 if is_top else 0)
+
+                if poly.is_valid and poly.area >= self.settings['small_feature']:
+                    polygons.append(poly)
+
+            union = make_valid(unary_union(polygons))
+            return self._finalize_geometry(union)
+
+        except Exception as e:
+            logging.error(f"Ошибка обработки слоя Z={z:.2f}: {str(e)}")
+            return MultiPolygon()
+
+    def _finalize_geometry(self, geom: Union[Polygon, MultiPolygon]) -> MultiPolygon:
+        """Финальная обработка геометрии"""
+        if geom.is_empty:
+            return MultiPolygon()
+
+        if isinstance(geom, Polygon):
+            geom = MultiPolygon([geom])
+
+        valid_geoms = []
+        for poly in geom.geoms:
+            if poly.is_valid and poly.area > self.settings['small_feature']:
+                if not poly.exterior.is_ccw:
+                    poly = Polygon(poly.exterior.coords[::-1])
+                valid_geoms.append(poly)
+
+        return MultiPolygon(valid_geoms)
+
+    def _generate_walls(self, geometry: MultiPolygon) -> List[np.ndarray]:
+        """Генерация периметров с микрооптимизацией"""
+        walls = []
+        nozzle = self.settings['nozzle_diameter']
+
+        for i in range(self.settings['perimeters']):
+            offset = -nozzle * (0.4 + 0.2 * i)
+            offset_geom = geometry.buffer(
+                offset,
+                join_style='mitre',
+                mitre_limit=self.settings['mitre_limit'],
+                resolution=64
+            )
+
+            if offset_geom.is_empty:
+                break
+
+            for poly in self._iter_polygons(offset_geom):
+                if poly.area < (nozzle * 0.3) ** 2:
+                    continue
+
+                coords = self._optimize_path(poly.exterior.coords)
+                if self._validate_wall(coords, nozzle):
+                    walls.append(coords)
+
+        return walls
+
+    def _optimize_path(self, coords: list) -> np.ndarray:
+        """Фильтрация микродвижений"""
+        filtered = [coords[0]]
+        for p in coords[1:]:
+            if np.linalg.norm(np.array(p) - filtered[-1]) > self.settings['min_segment_length']:
+                filtered.append(p)
+        return np.array(filtered)
+
+    def _validate_wall(self, coords: np.ndarray, nozzle: float) -> bool:
+        """Проверка качества периметра"""
+        if len(coords) < 3:
+            return False
+
+        lengths = np.linalg.norm(np.diff(coords, axis=0), axis=1)
+        if np.any(lengths < self.settings['min_segment_length']):
+            logging.warning("Обнаружены слишком короткие сегменты стенки")
+            return False
+
+        return True
+
+    def _generate_infill(self, geometry: MultiPolygon, layer_num: int, total_layers: int) -> List[np.ndarray]:
+        """Генерация заполнения с точной плотностью"""
+        patterns = []
+        is_solid = layer_num < self.settings['bottom_layers'] or layer_num >= (
+                    total_layers - self.settings['top_layers'])
+
+        for poly in self._iter_polygons(geometry):
+            expanded = poly.buffer(
+                self.settings['nozzle_diameter'] * self.settings['solid_overlap'],
+                resolution=32
+            )
+
+            for angle in self.settings['fill_angles']:
+                lines = self._generate_infill_pattern(expanded, angle, is_solid, poly)
+                patterns.extend(lines)
+
+        return patterns
+
+    def _generate_infill_pattern(self, expanded: Polygon, angle: float, is_solid: bool, original: Polygon) -> List[
+        np.ndarray]:
+        """Точная генерация заполнения с обрезкой"""
+        if is_solid:
+            spacing = self.settings['nozzle_diameter'] * 0.9
+        else:
+            density = self.settings['infill_density'] / 100
+            if density <= 0:
+                return []
+            spacing = self.settings['nozzle_diameter'] / density
+
+        # Генерация линий с поворотом
+        rotated = affinity.rotate(expanded, angle, origin='centroid')
+        bbox = rotated.bounds
+        offset = self.settings['nozzle_diameter'] * 3
+
+        lines = []
+        for x in np.arange(bbox[0] - offset, bbox[2] + offset, spacing):
+            line = LineString([(x, bbox[1] - offset), (x, bbox[3] + offset)])
+            intersection = rotated.intersection(line)
+
+            if intersection.is_empty:
+                continue
+
+            valid_lines = []
+            if isinstance(intersection, LineString):
+                valid_lines.append(intersection)
+            elif isinstance(intersection, MultiLineString):
+                valid_lines.extend(intersection.geoms)
+
+            # Обратный поворот и обрезка по оригинальному полигону
+            for line in valid_lines:
+                original_line = affinity.rotate(line, -angle, origin=expanded.centroid)
+                clipped_line = original_line.intersection(original)
+
+                if clipped_line.is_empty or clipped_line.length < self.settings['nozzle_diameter']:
+                    continue
+
+                if isinstance(clipped_line, MultiLineString):
+                    lines.extend([np.array(l.coords) for l in clipped_line.geoms])
+                else:
+                    lines.append(np.array(clipped_line.coords))
+
+        return lines
+
+    def _iter_polygons(self, geom: Union[Polygon, MultiPolygon]):
+        """Итератор по полигонам"""
+        if isinstance(geom, MultiPolygon):
+            yield from geom.geoms
+        elif isinstance(geom, Polygon):
+            yield geom
+
+    def _export_gcode(self, layers: List[dict], output_path: str) -> None:
+        """Генерация G-кода с учетом реальных параметров"""
+        output = [
+            "G28 ; Home",
+            f"M104 S{self.settings['print_temp']} ; Нагрев экструдера",
+            f"M140 S{self.settings['bed_temp']} ; Нагрев стола",
+            "G1 Z10 F5000 ; Подъем сопла"
+        ]
+
+        for layer in layers:
+            output.append(f"\n;LAYER:{layer['z']:.2f}")
+            output.append(f"G0 Z{layer['z'] + self.settings['z_hop']:.2f} F3000")
+            output.append(f"G1 Z{layer['z']:.2f} F{self.settings['print_speed'] * 60}")
+
+            # Периметры
+            for path in layer['walls']:
+                self._extrude_path(output, path, self.settings['outer_wall_speed'], 1.05)
+
+            # Заполнение
+            for path in layer['infill']:
+                self._extrude_path(output, path, self.settings['infill_speed'], 0.98)
+
+        output.extend([
+            "M104 S0 ; Выключение экструдера",
+            "M140 S0 ; Выключение стола",
+            "G28 X ; Возврат в начало по X",
+            "M84 ; Выключение двигателей"
+        ])
+
+        with open(output_path, 'w') as f:
+            f.write('\n'.join(output))
+
+    def _extrude_path(self, gcode: list, path: np.ndarray, speed: int, flow: float):
+        """Реалистичный расчет экструзии"""
+        if len(path) < 2:
+            return
+
+        nozzle_area = math.pi * (self.settings['nozzle_diameter'] / 2) ** 2
+
+        for i in range(1, len(path)):
+            x0, y0 = path[i - 1]
+            x1, y1 = path[i]
+            distance = math.hypot(x1 - x0, y1 - y0)
+
+            if distance < self.settings['min_segment_length']:
+                continue
+
+            e = (distance * self.settings['layer_height'] * self.settings['nozzle_diameter'] * flow) / nozzle_area
+            self.current_e += e
+
+            if i == 1:
+                gcode.append(f"G0 X{x0:.3f} Y{y0:.3f} F{self.settings['travel_speed'] * 60}")
+
+            gcode.append(f"G1 X{x1:.3f} Y{y1:.3f} E{self.current_e:.5f} F{speed * 60}")
+
+    def _export_svg(self, layers: List[dict], base_name: str) -> None:
+        """Экспорт слоев в SVG для отладки"""
+        for i, layer in enumerate(layers):
+            dwg = Drawing(f"{base_name}_{i:03d}.svg", profile='tiny')
+            for path in layer['walls'] + layer['infill']:
+                points = [(x, -y) for x, y in path]
+                dwg.add(dwg.polyline(points, stroke='black', fill='none', stroke_width=0.1))
+            dwg.save()
+
+
+class TelegramBot:
+    def __init__(self, token: str):
+        self.application = Application.builder().token(token).build()
+        self.slice_engine = SliceEngine()
+
+        self.application.add_handler(CommandHandler("start", self.start))
+        self.application.add_handler(MessageHandler(
+            filters.Document.FileExtension("stl"),
+            self.handle_file
+        ))
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.message.reply_text(
+            "Привет! Отправь мне STL файл для преобразования в G-код."
+        )
+
+    async def handle_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            file = await update.message.document.get_file()
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                stl_path = str(Path(tmp_dir) / "model.stl")
+                await file.download_to_drive(custom_path=stl_path)
+
+                if not os.path.exists(stl_path):
+                    raise ValueError("Файл не загружен")
+
+                gcode_path = str(Path(tmp_dir) / "output.gcode")
+                self.slice_engine.process(stl_path, gcode_path)
+
+                with open(gcode_path, 'rb') as f:
+                    await update.message.reply_document(
+                        document=f,
+                        caption="Ваш G-код готов!"
+                    )
+
+        except Exception as e:
+            logger.error(f"Ошибка: {type(e).__name__} - {str(e)}")
+            await update.message.reply_text(f"Ошибка обработки: {str(e)}")
+
+    def run(self) -> None:
+        self.application.run_polling()
+
+
+if __name__ == "__main__":
+    TOKEN = "0000"
+    if not TOKEN:
+        raise ValueError("Не задан TELEGRAM_BOT_TOKEN")
+
+    bot = TelegramBot(TOKEN)
+    bot.run()
